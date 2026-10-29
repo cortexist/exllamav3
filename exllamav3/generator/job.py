@@ -278,6 +278,7 @@ class Job:
         self.rq_prompt_tokens = rq_state.get("prompt_tokens")
         self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
+        self.sparse_head_seeded = False
         self.cached_pages = 0
         self.cached_tokens = 0
         self.is_finished = False
@@ -1276,11 +1277,19 @@ class Job:
         self.pagetable = generator.pagetable
         self.skips = 0
 
-        # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
-        # requeue budget's headroom below so that budget still fits the cache exactly
+        # The cache bounds the response: past the prompt, every generated token and the drafter's
+        # speculative window (written past the budget by a verification pass) have to fit. That is
+        # the limit when none is given, and the cap on one that is, so a chunked job that writes
+        # its way to the end of the cache ends with max_new_tokens instead of asserting at the
+        # requeue that finds no pages left (the cap holds for the requeued rounds too, whose prompt
+        # is the sequence so far). A prompt with no room at all keeps its limit and fails the page
+        # check below, which is the message the caller expects for that
+        room = self.generator.max_total_tokens - max(len(s.input_ids) for s in self.sequences) \
+               - 1 - self.generator.max_draft_tokens
         if self.max_new_tokens is None:
-            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
-                                      - 1 - self.generator.max_draft_tokens)
+            self.max_new_tokens = max(1, room)
+        elif room >= 1:
+            self.max_new_tokens = min(self.max_new_tokens, room)
 
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
@@ -1289,7 +1298,12 @@ class Job:
                     if self.generator.recurrent_cache is not None else PAGE_SIZE
                 x = len(self.sequences[0].input_ids)
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
-                self.max_rq_tokens = y - x
+                # The final segment: a budget aligned to the end of the cache leaves no room for the
+                # speculative window past it, and no requeue can follow it anyway, so it is cut to what
+                # the cache holds rather than refused (issue: a 61k-token prompt in a 64k cache with a
+                # 31-token draft window could not be enqueued at all)
+                y = min(y, self.generator.max_total_tokens - self.generator.max_draft_tokens)
+                self.max_rq_tokens = max(1, y - x)
             # The requeue lands exactly on the aligned boundary, so a recurrent checkpoint stashed there
             # resumes the next segment with nothing to replay. A speculative window writes K/V past that
             # point, so drafting jobs reserve the window beyond the budget rather than requeueing early
@@ -1374,7 +1388,7 @@ class Job:
         return new_pages
 
 
-    def prefill(self, results: list):
+    def prefill(self, results: list, chunk_size: int | None = None):
         """
         Run prompt prefill chunks for already allocated cache pages.
 
@@ -1382,6 +1396,9 @@ class Job:
         sequence's kv_position through the prompt, skipping any prefix whose K/V pages were already cached, running
         model forward passes for uncached chunks, updating page hashes as pages become complete, and stashing
         recurrent checkpoints when applicable. It emits progress events but does not sample new completion tokens.
+
+        chunk_size, when given, bounds the forward pass of this call below the generator's max_chunk_size (prompt
+        ingestion alongside generating jobs). The cached-page skip still covers the full max_chunk_size window.
         """
 
         if self.time_first_prefill is None:
@@ -1427,6 +1444,11 @@ class Job:
                 if page.kv_position == PAGE_SIZE:
                     prefill_end = local_idx * PAGE_SIZE
                     break
+
+            # A reduced chunk bounds the forward pass only, after the cached pages were skipped over the full
+            # window above, so a job resuming a cached prompt still walks it at the usual rate
+            if chunk_size is not None:
+                prefill_end = min(prefill_end, (prefill_start + chunk_size) // PAGE_SIZE * PAGE_SIZE)
 
             if prefill_end <= prefill_start:
                 continue
@@ -1565,12 +1587,15 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
-                if self.generator.mtp_draft:
+                dm = self.generator.draft_model
+                if self.generator.mtp_draft and not (dm is not None and dm.caps.get("draft_uses_target_cache")):
                     # MTP needs the target's post-final-norm state for every prompt token.
                     # Normal prefill stops at the last cache-writing layer, before final norm.
                     params["last_tokens_only"] = 1
                     self.generator.model.forward(input_ids = prefill_ids, params = params)
                 else:
+                    # (A drafter fed the last decoder layer's output takes the regular prefill, which runs
+                    # through that layer)
                     self.generator.model.prefill(input_ids = prefill_ids, params = params)
 
                 if self.generator.dflash_draft:
@@ -1752,20 +1777,28 @@ class Job:
         """
         Return whether the current sequence position should stash a recurrent checkpoint.
 
-        Checkpoints are measured from the end of the cached K/V prefix so restored pages and recurrent state stay in
-        sync. An explicit interval overrides the normal policy; otherwise prefill uses the coarser prompt-prefill
-        interval until it nears the generation boundary, where it switches to the normal recurrent checkpoint
-        interval.
+        Checkpoints sit on page boundaries, spaced at least the checkpoint interval apart: a position qualifies
+        once it is the interval or more past the previous checkpoint, or past the end of the cached K/V prefix
+        (which a restored state matches) while there is none. Positions are not required to fall on a fixed grid,
+        so prefill chunks may vary in size. An explicit interval overrides the normal policy; otherwise prefill
+        uses the coarser prompt-ingestion interval until it nears the generation boundary, where it switches to
+        the normal recurrent checkpoint interval.
         """
         seq = self.sequences[0]
-        prompt_len = len(seq.sequence_ids) - 1
         seq_pos = seq.kv_position
+        if seq_pos % PAGE_SIZE:
+            return False
         if override_interval:
             return seq_pos % override_interval == 0
-        elif seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval == 0
+        prompt_len = len(seq.sequence_ids) - 1
+        if seq_pos >= prompt_len - self.generator.max_chunk_size * 2:
+            interval = self.generator.recurrent_checkpoint_interval
         else:
-            return (seq_pos - self.cached_pages * PAGE_SIZE) % self.generator.recurrent_checkpoint_interval_pp == 0
+            interval = self.generator.recurrent_checkpoint_interval_pp
+        anchor = self.last_recurrent_checkpoint_pos
+        if anchor is None:
+            anchor = self.cached_pages * PAGE_SIZE
+        return seq_pos - anchor >= interval
 
 
     def mm_exact_spans(self, seq):
